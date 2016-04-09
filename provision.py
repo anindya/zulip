@@ -3,6 +3,7 @@ import os
 import sys
 import logging
 import platform
+import subprocess
 
 try:
     import sh
@@ -46,27 +47,43 @@ APT_DEPENDENCIES = {
 }
 
 VENV_PATH = "/srv/zulip-venv"
-ZULIP_PATH = "/srv/zulip"
+ZULIP_PATH = os.path.dirname(os.path.abspath(__file__))
 
-if not os.path.exists(os.path.join(os.path.dirname(__file__), ".git")):
-    print("Error: No Zulip git repository present at /srv/zulip!")
+if not os.path.exists(os.path.join(ZULIP_PATH, ".git")):
+    print("Error: No Zulip git repository present!")
     print("To setup the Zulip development environment, you should clone the code")
     print("from GitHub, rather than using a Zulip production release tarball.")
     sys.exit(1)
 
-# TODO: Parse arguments properly
-if "--travis" in sys.argv or "--docker" in sys.argv:
-    ZULIP_PATH = "."
+if platform.architecture()[0] == '64bit':
+    arch = 'amd64'
+elif platform.architecture()[0] == '32bit':
+    arch = "i386"
+else:
+    logging.critical("Only x86 is supported; ping zulip-devel@googlegroups.com if you want another architecture.")
+    sys.exit(1)
+
+# Ideally we wouldn't need to install a dependency here, before we
+# know the codename.
+subprocess.check_call(["sudo", "apt-get", "install", "-y", "lsb-release"])
+vendor = subprocess.check_output(["lsb_release", "-is"]).strip()
+codename = subprocess.check_output(["lsb_release", "-cs"]).strip()
+if not (vendor in SUPPORTED_PLATFORMS and codename in SUPPORTED_PLATFORMS[vendor]):
+    logging.critical("Unsupported platform: {} {}".format(vendor, codename))
+    sys.exit(1)
+
+POSTGRES_VERSION_MAP = {
+    "trusty": "9.3",
+}
+POSTGRES_VERSION = POSTGRES_VERSION_MAP[codename]
 
 # tsearch-extras is an extension to postgres's built-in full-text search.
 # TODO: use a real APT repository
 TSEARCH_URL_PATTERN = "https://github.com/zulip/zulip-dist-tsearch-extras/raw/master/{}_{}_{}.deb?raw=1"
-TSEARCH_PACKAGE_NAME = {
-    "trusty": "postgresql-9.3-tsearch-extras"
-}
+TSEARCH_PACKAGE_NAME = "postgresql-%s-tsearch-extras" % (POSTGRES_VERSION,)
 TSEARCH_VERSION = "0.1.3"
-# TODO: this path is platform-specific!
-TSEARCH_STOPWORDS_PATH = "/usr/share/postgresql/9.3/tsearch_data/"
+TSEARCH_URL = TSEARCH_URL_PATTERN.format(TSEARCH_PACKAGE_NAME, TSEARCH_VERSION, arch)
+TSEARCH_STOPWORDS_PATH = "/usr/share/postgresql/%s/tsearch_data/" % (POSTGRES_VERSION,)
 REPO_STOPWORDS_PATH = os.path.join(
     ZULIP_PATH,
     "puppet",
@@ -80,34 +97,16 @@ LOUD = dict(_out=sys.stdout, _err=sys.stderr)
 
 
 def main():
-    log = logging.getLogger("zulip-provisioner")
-
-    if platform.architecture()[0] == '64bit':
-        arch = 'amd64'
-    elif platform.architecture()[0] == '32bit':
-        arch = "i386"
-    else:
-        log.critical("Only x86 is supported; ping zulip-devel@googlegroups.com if you want another architecture.")
-        sys.exit(1)
-
-    vendor, version, codename = platform.dist()
-
-    if not (vendor in SUPPORTED_PLATFORMS and codename in SUPPORTED_PLATFORMS[vendor]):
-        log.critical("Unsupported platform: {} {}".format(vendor, codename))
 
     with sh.sudo:
         sh.apt_get.update(**LOUD)
 
-        sh.apt_get.install(*APT_DEPENDENCIES["trusty"], assume_yes=True, **LOUD)
+        sh.apt_get.install(*APT_DEPENDENCIES[codename], assume_yes=True, **LOUD)
 
     temp_deb_path = sh.mktemp("package_XXXXXX.deb", tmpdir=True)
 
     sh.wget(
-        TSEARCH_URL_PATTERN.format(
-            TSEARCH_PACKAGE_NAME["trusty"],
-            TSEARCH_VERSION,
-            arch,
-        ),
+        TSEARCH_URL,
         output_document=temp_deb_path,
         **LOUD
     )
@@ -164,8 +163,8 @@ def main():
         os.system("sudo service memcached restart")
     elif "--docker" in sys.argv:
         os.system("sudo service rabbitmq-server restart")
-        os.system("sudo pg_dropcluster --stop 9.3 main")
-        os.system("sudo pg_createcluster -e utf8 --start 9.3 main")
+        os.system("sudo pg_dropcluster --stop %s main" % (POSTGRES_VERSION,))
+        os.system("sudo pg_createcluster -e utf8 --start %s main" % (POSTGRES_VERSION,))
         os.system("sudo service redis-server restart")
         os.system("sudo service memcached restart")
     sh.configure_rabbitmq(**LOUD)
